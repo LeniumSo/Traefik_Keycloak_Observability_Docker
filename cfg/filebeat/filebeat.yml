@@ -1,0 +1,32 @@
+﻿filebeat.inputs:
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/traefik/traefik.log
+    json.keys_under_root: true
+    json.add_error_key: true
+    fields:
+      service: traefik
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/traefik/access.log
+    json.keys_under_root: true
+    json.add_error_key: true
+    fields:
+      service: traefik
+      type: access
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/keycloak/log/*.log
+    fields:
+      service: keycloak
+
+output.logstash:
+  hosts: ["logstash:5044"]
+
+setup.kibana:
+  host: "http://kibana:5601"
+
+setup.ilm.enabled: true

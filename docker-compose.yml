@@ -1,0 +1,337 @@
+
+volumes:
+  keycloak_postgres_data:
+  elasticsearch_data:
+  traefik-logs:
+  keycloak-logs:
+  filebeat-data:
+
+networks:
+  intranet: 
+    name: ${DOCKER_NETWORK}
+
+services:
+
+#traefik
+  traefik_gateway:
+    image: traefik:v3.4.4
+    container_name: traefik_gateway
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=${DOCKER_NETWORK}"
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"      
+      - "--entrypoints.http.address=:80"
+      - "--api=true"
+      - "--experimental.otlpLogs=true"
+      - "--log.level=${TRAEFIC_LOG_LEVEL}"
+      - "--log.filePath=/var/log/traefik.log"
+      - "--log.format=json" 
+      - "--accessLog.filePath=/var/log/access.log"
+      - "--accessLog.format=json"
+      - "--metrics.prometheus=true"
+      - "--metrics.otlp.grpc.endpoint=otel-collector:4317"
+      - "--metrics.otlp.grpc.insecure=true"
+      - "--tracing.otlp.grpc.endpoint=otel-collector:4317"
+      - "--tracing.otlp.grpc.insecure=true"
+    ports:
+      - "0.0.0.0:80:80"
+    restart: unless-stopped
+    networks:
+      - ${DOCKER_NETWORK}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${TRAEFIK_CONFIG_PATH}traefik.toml:/etc/traefik/dynamic/traefik.toml
+      - ${CERTS_PATH}:/etc/certs/    
+      - traefik-logs:/var/log
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.dashboard.rule=Host(`traefik.${HOST_DOMAIN}`)
+      - traefik.http.routers.dashboard.service=api@internal   
+      - traefik.http.routers.dashboard.middlewares=traefik-forward-auth    
+
+  traefik-forward-auth:
+    image: thomseddon/traefik-forward-auth
+    container_name: traefik-forward-auth
+    restart: unless-stopped
+    depends_on:
+      - keycloak
+      - traefik_gateway
+    extra_hosts:
+      - "${HOST_DOMAIN}:${DOCKER_GATEWAY_IP}"
+      - "auth.${HOST_DOMAIN}:${DOCKER_GATEWAY_IP}"
+    environment:
+      - DEFAULT_PROVIDER=oidc
+      - SECRET=${FORWARD_AUTH_SECRET}
+      - PROVIDERS_OIDC_ISSUER_URL=http://auth.${HOST_DOMAIN}/realms/${KEYCLOAK_REALM}
+      - PROVIDERS_OIDC_CLIENT_ID=gateway:traefik
+      - PROVIDERS_OIDC_CLIENT_SECRET=${TRAEFIK_CLIENT_SECRET}
+      - LOG_LEVEL=${KEYCLOAK_LOG_LEVEL}
+      - COOKIE_DOMAIN=${HOST_DOMAIN}
+      - INSECURE_COOKIE=true
+    networks:
+      - ${DOCKER_NETWORK}
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${DOCKER_NETWORK}
+      - traefik.backend=traefik-forward-auth
+      - traefik.http.services.traefik-forward-auth.loadbalancer.server.port=4181
+      - traefik.http.middlewares.traefik-forward-auth.forwardauth.address=http://traefik-forward-auth:4181
+      - traefik.http.middlewares.traefik-forward-auth.forwardauth.authResponseHeaders=X-Forwarded-User
+      - traefik.http.middlewares.traefik-forward-auth.forwardauth.trustForwardHeader=true
+      
+  
+#keycloak 
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3.0
+    container_name: keycloak
+    environment:
+      KC_DB: ${KEYCLOAK_DATABASE_TYPE}
+      KC_DB_URL_HOST: ${KEYCLOAK_DATABASE_HOST}
+      KC_DB_URL_DATABASE: ${KEYCLOAK_DATABASE}
+      KC_DB_USERNAME: ${KEYCLOAK_DATABASE_USERNAME}
+      KC_DB_PASSWORD: ${KEYCLOAK_DATABASE_PASSWORD}
+      KC_HOSTNAME: auth.${HOST_DOMAIN}
+      KC_HTTP_PORT: 8080
+      KC_HTTP_ENABLED: true
+      KEYCLOAK_ADMIN: ${KEYCLOAK_DEFAULT_ADMIN}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_DEFAULT_ADMIN_PASSWORD}
+      KC_PROXY: edge
+      KC_PROXY_HEADERS: xforwarded
+      KC_HOSTNAME_STRICT: false
+      KC_LOG_LEVEL: ${KEYCLOAK_LOG_LEVEL}
+      PROXY_ADDRESS_FORWARDING: true
+      KC_LOG: console,file
+      KC_LOG_FILE_OUTPUT: json
+    command: ["start-dev", "--import-realm"]
+    depends_on:
+      - keycloak_postgres
+    networks:
+      - ${DOCKER_NETWORK}
+    volumes:
+      - keycloak-logs:/opt/keycloak/data
+      - ./export/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.keycloak.rule=Host(`auth.${HOST_DOMAIN}`)
+      - traefik.http.routers.keycloak.entrypoints=http
+      - traefik.http.services.keycloak.loadbalancer.server.port=8080
+
+  keycloak_postgres:
+    image: postgres:17
+    container_name: keycloak_postgres
+    environment:
+      POSTGRES_DB: ${KEYCLOAK_DATABASE}
+      POSTGRES_USER: ${KEYCLOAK_DATABASE_USERNAME}
+      POSTGRES_PASSWORD: ${KEYCLOAK_DATABASE_PASSWORD}
+    volumes:
+      - keycloak_postgres_data:/var/lib/postgresql/data
+    networks:
+      - ${DOCKER_NETWORK}
+
+
+#grafana
+  grafana:
+    image: grafana/grafana:latest
+    extra_hosts:
+      - "${HOST_DOMAIN}:${DOCKER_GATEWAY_IP}"
+      - "auth.${HOST_DOMAIN}:${DOCKER_GATEWAY_IP}"
+    environment: 
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin      
+    networks:
+      - ${DOCKER_NETWORK}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.grafana.rule=Host(`grafana.${HOST_DOMAIN}`)
+      - traefik.http.routers.grafana.entrypoints=http
+      - traefik.http.services.grafana.loadbalancer.server.port=3000
+      - traefik.http.routers.grafana.middlewares=grafana-forward-auth
+
+  grafana-forward-auth:
+    image: thomseddon/traefik-forward-auth
+    container_name: grafana-forward-auth
+    restart: unless-stopped
+    depends_on:
+      - keycloak
+      - traefik_gateway
+      - grafana
+    extra_hosts:
+      - "${HOST_DOMAIN}:${DOCKER_GATEWAY_IP}"
+      - "auth.${HOST_DOMAIN}:${DOCKER_GATEWAY_IP}"
+    environment:
+      - DEFAULT_PROVIDER=oidc
+      - SECRET=${FORWARD_AUTH_SECRET}
+      - PROVIDERS_OIDC_ISSUER_URL=http://auth.${HOST_DOMAIN}/realms/${KEYCLOAK_REALM}
+      - PROVIDERS_OIDC_CLIENT_ID=observability:grafana
+      - PROVIDERS_OIDC_CLIENT_SECRET=${GRAFANA_CLIENT_SECRET}
+      - LOG_LEVEL=${KEYCLOAK_LOG_LEVEL}
+      - COOKIE_DOMAIN=${HOST_DOMAIN}
+      - INSECURE_COOKIE=true
+    networks:
+      - ${DOCKER_NETWORK}
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${DOCKER_NETWORK}
+      - traefik.backend=grafana-forward-auth
+      - traefik.http.services.grafana-forward-auth.loadbalancer.server.port=4181
+      - traefik.http.middlewares.grafana-forward-auth.forwardauth.address=http://grafana-forward-auth:4181
+      - traefik.http.middlewares.grafana-forward-auth.forwardauth.authResponseHeaders=X-Forwarded-User
+      - traefik.http.middlewares.grafana-forward-auth.forwardauth.trustForwardHeader=true
+      
+
+#jaeger
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    networks:
+      - ${DOCKER_NETWORK}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.jaeger.rule=Host(`jaeger.${HOST_DOMAIN}`)
+      - traefik.http.routers.jaeger.entrypoints=http
+      - traefik.http.services.jaeger.loadbalancer.server.port=16686
+      - traefik.http.routers.jaeger.middlewares=jaeger-forward-auth
+
+  jaeger-forward-auth:
+    image: thomseddon/traefik-forward-auth
+    container_name: jaeger-forward-auth
+    restart: unless-stopped
+    depends_on:
+      - keycloak
+      - traefik_gateway
+      - jaeger
+    extra_hosts:
+      - "${HOST_DOMAIN}:${DOCKER_GATEWAY_IP}"
+      - "auth.${HOST_DOMAIN}:${DOCKER_GATEWAY_IP}"
+    environment:
+      - DEFAULT_PROVIDER=oidc
+      - SECRET=${FORWARD_AUTH_SECRET}
+      - PROVIDERS_OIDC_ISSUER_URL=http://auth.${HOST_DOMAIN}/realms/${KEYCLOAK_REALM}
+      - PROVIDERS_OIDC_CLIENT_ID=observability:jaeger
+      - PROVIDERS_OIDC_CLIENT_SECRET=${JAEGER_CLIENT_SECRET}
+      - LOG_LEVEL=${KEYCLOAK_LOG_LEVEL}
+      - COOKIE_DOMAIN=${HOST_DOMAIN}
+      - INSECURE_COOKIE=true
+    networks:
+      - ${DOCKER_NETWORK}
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${DOCKER_NETWORK}
+      - traefik.backend=jaeger-forward-auth
+      - traefik.http.services.jaeger-forward-auth.loadbalancer.server.port=4181
+      - traefik.http.middlewares.jaeger-forward-auth.forwardauth.address=http://jaeger-forward-auth:4181
+      - traefik.http.middlewares.jaeger-forward-auth.forwardauth.authResponseHeaders=X-Forwarded-User
+      - traefik.http.middlewares.jaeger-forward-auth.forwardauth.trustForwardHeader=true
+
+  
+#open-telemetry
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector-config.yml"]
+    depends_on:
+      - prometheus
+    volumes:
+      - ./cfg/otel-collector/otel-collector-config.yml:/etc/otel-collector-config.yml
+    networks:
+      - ${DOCKER_NETWORK}
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./cfg/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - ${DOCKER_NETWORK}
+
+
+#ELK
+
+  elasticsearch:
+    image: elasticsearch:8.0.0
+    container_name: elasticsearch
+    networks:
+      - ${DOCKER_NETWORK}
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+
+  logstash:
+    image: logstash:8.0.0
+    container_name: logstash
+    networks:
+      - ${DOCKER_NETWORK}
+    environment:
+      - log.level=debug
+    volumes:
+      - ./cfg/logstash/config:/usr/share/logstash/config
+      - ./cfg/logstash/pipeline:/usr/share/logstash/pipeline
+    depends_on:
+      - elasticsearch
+
+  filebeat:
+    image: elastic/filebeat:8.18.4
+    user: root
+    restart: unless-stopped
+    networks:
+      - ${DOCKER_NETWORK}
+    volumes:
+      - traefik-logs:/var/log/traefik:rw
+      - keycloak-logs:/var/log/keycloak:Z
+      - ./cfg/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - filebeat-data:/usr/share/filebeat/data
+    environment:
+      - strict.perms=false
+      - BEAT_STRICT_PERMS=false
+    depends_on:
+      - elasticsearch
+
+  kibana:
+    image: kibana:8.0.0
+    container_name: kibana
+    networks:
+      - ${DOCKER_NETWORK}
+    environment:
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    depends_on:
+      - elasticsearch
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.kibana.rule=Host(`kibana.${HOST_DOMAIN}`)
+      - traefik.http.routers.kibana.entrypoints=http
+      - traefik.http.services.kibana.loadbalancer.server.port=5601
+      - traefik.http.routers.kibana.middlewares=kibana-forward-auth
+
+  kibana-forward-auth:
+    image: thomseddon/traefik-forward-auth
+    container_name: kibana-forward-auth
+    restart: unless-stopped
+    depends_on:
+      - keycloak
+      - traefik_gateway
+      - kibana
+    extra_hosts:
+      - "${HOST_DOMAIN}:${DOCKER_GATEWAY_IP}"
+      - "auth.${HOST_DOMAIN}:${DOCKER_GATEWAY_IP}"
+    environment:
+      - DEFAULT_PROVIDER=oidc
+      - SECRET=${FORWARD_AUTH_SECRET}
+      - PROVIDERS_OIDC_ISSUER_URL=http://auth.${HOST_DOMAIN}/realms/${KEYCLOAK_REALM}
+      - PROVIDERS_OIDC_CLIENT_ID=observability:kibana
+      - PROVIDERS_OIDC_CLIENT_SECRET=${KIBANA_CLIENT_SECRET}
+      - LOG_LEVEL=${KEYCLOAK_LOG_LEVEL}
+      - COOKIE_DOMAIN=${HOST_DOMAIN}
+      - INSECURE_COOKIE=true
+    networks:
+      - ${DOCKER_NETWORK}
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${DOCKER_NETWORK}
+      - traefik.backend=kibana-forward-auth
+      - traefik.http.services.kibana-forward-auth.loadbalancer.server.port=4181
+      - traefik.http.middlewares.kibana-forward-auth.forwardauth.address=http://kibana-forward-auth:4181
+      - traefik.http.middlewares.kibana-forward-auth.forwardauth.authResponseHeaders=X-Forwarded-User
+      - traefik.http.middlewares.kibana-forward-auth.forwardauth.trustForwardHeader=true
